@@ -1,11 +1,44 @@
-output "instance_id" {
-  value = openstack_compute_instance_v2.app.id
+############################
+# [CONTRACT] User Accounts Output
+############################
+
+# CONTRACT-SCHEMA:
+# local.user_accounts = {
+#   "<team>-<username>": {
+#     type     = "password"
+#     ip       = "1.2.3.4"
+#     port     = 80
+#     username = "team-a@example.com"
+#     auth     = "<password>"
+#   }
+# }
+
+output "user_accounts" {
+  description = "[CONTRACT] User accounts - Struktur siehe Kommentar oben"
+  value       = local.user_accounts
+  sensitive   = true
 }
 
-output "fixed_ipv4" {
-  value = openstack_compute_instance_v2.app.network[0].fixed_ip_v4
+############################
+# Team-VM Details
+############################
+
+output "team_vms" {
+  description = "Details aller Team-VMs"
+  value = {
+    for team in local.teams_list : team => {
+      instance_id   = openstack_compute_instance_v2.team_vm[team].id
+      instance_name = openstack_compute_instance_v2.team_vm[team].name
+      fixed_ip      = openstack_compute_instance_v2.team_vm[team].network[0].fixed_ip_v4
+      floating_ip   = local.enable_floating_ip ? openstack_networking_floatingip_v2.team_fip[team].address : null
+      weblatex_url  = local.enable_floating_ip ? "http://${openstack_networking_floatingip_v2.team_fip[team].address}" : "http://${openstack_compute_instance_v2.team_vm[team].network[0].fixed_ip_v4}"
+    }
+  }
 }
 
-output "floating_ip" {
-  value = var.enable_floating_ip ? openstack_networking_floatingip_v2.fip[0].address : null
+output "teams_summary" {
+  description = "Übersicht: Teams und User-Anzahl"
+  value = {
+    for team in local.teams_list : team => length([for uid, u in local.users_map : u if u.team == team])
+  }
 }
