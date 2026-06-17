@@ -27,13 +27,11 @@ locals {
   enable_floating_ip = true
 }
 
-# Packer-Image aus Glance laden
 data "openstack_images_image_v2" "image" {
   name        = var.image_name
   most_recent = true
 }
 
-# External Network für Floating IPs
 data "openstack_networking_network_v2" "external" {
   name = var.floating_ip_pool
 }
@@ -56,16 +54,11 @@ locals {
 
   users_map  = { for user in local.all_users : user.id => user }
   teams_list = distinct([for user in local.all_users : user.team])
-
-  # Team-Email als Web-LaTeX-Login
-  team_account_email = {
-    for team in local.teams_list : team => "${team}@example.com"
-  }
 }
 
-# Ein Passwort pro Team
-resource "random_password" "team_passwords" {
-  for_each         = toset(local.teams_list)
+# Ein Passwort pro individuellem User
+resource "random_password" "user_passwords" {
+  for_each         = local.users_map
   length           = 16
   special          = true
   override_special = "!#*+-_~"
@@ -103,9 +96,14 @@ resource "openstack_compute_instance_v2" "team_vm" {
   }
 
   user_data = templatefile("${path.module}/user-data.yaml.tpl", {
-    latex_document = var.latex_document
-    team_username  = local.team_account_email[each.key]
-    team_password  = random_password.team_passwords[each.key].result
+    team_users = [
+      for uid, user in local.users_map : {
+        email    = user.email
+        password = random_password.user_passwords[uid].result
+      }
+      if user.team == each.key
+    ]
+    assignment_files = var.assignment_files
   })
 
   metadata = {
@@ -141,8 +139,8 @@ locals {
       type     = "password"
       ip       = local.enable_floating_ip ? openstack_networking_floatingip_v2.team_fip[user.team].address : openstack_networking_port_v2.team_port[user.team].all_fixed_ips[0]
       port     = 80
-      username = local.team_account_email[user.team]
-      auth     = random_password.team_passwords[user.team].result
+      username = user.email
+      auth     = random_password.user_passwords[uid].result
     }
   }
 }

@@ -1,24 +1,27 @@
 #cloud-config
 
 bootcmd:
-  - mkdir -p /etc/weblatex
-  - chmod 750 /etc/weblatex
+  - mkdir -p /etc/weblatex/users
+  - chown root:www-data /etc/weblatex /etc/weblatex/users
+  - chmod 750 /etc/weblatex /etc/weblatex/users
 
 write_files:
-%{ if latex_document != "" ~}
-  - path: /tmp/document.tex.b64
-    permissions: '0600'
+%{ for uid, file in assignment_files ~}
+  - path: /tmp/assignment/${file.name}
+    permissions: '0644'
     owner: root:root
     encoding: b64
-    content: ${latex_document}
-%{ endif ~}
+    content: ${file.content_b64}
+%{ endfor ~}
 
-  - path: /etc/weblatex/credentials.env
+%{ for user in team_users ~}
+  - path: /etc/weblatex/users/${replace(replace(user.email, "@", "_at_"), ".", "-")}.env
     permissions: '0640'
     owner: root:www-data
     content: |
-      USERNAME=${team_username}
-      PASSWORD=${team_password}
+      EMAIL=${user.email}
+      PASSWORD=${user.password}
+%{ endfor ~}
 
   - path: /usr/local/bin/weblatex-provision.sh
     permissions: '0700'
@@ -27,68 +30,82 @@ write_files:
       #!/bin/bash
       set -euo pipefail
       LOG="[weblatex-provision]"
-      TEX_FILE="/var/www/weblatex/document.tex"
-      OUT_DIR="/var/www/weblatex"
+      BASE_DIR="/var/www/weblatex"
 
-      mkdir -p "$OUT_DIR"
-      chown www-data:www-data "$OUT_DIR"
+      mkdir -p "$BASE_DIR"
+      chown www-data:www-data "$BASE_DIR"
+      chmod 755 "$BASE_DIR"
 
-      # ── 1. .tex Startwert setzen ──────────────────────────────────────────────
-      if [ -f /tmp/document.tex.b64 ] && [ -s /tmp/document.tex.b64 ]; then
-          echo "$LOG STEP 1: Decoding uploaded .tex document..."
-          base64 -d /tmp/document.tex.b64 > "$TEX_FILE"
-          rm -f /tmp/document.tex.b64
-          echo "$LOG Decoded: $(wc -c < "$TEX_FILE") bytes"
-      else
-          echo "$LOG STEP 1: No document provided — writing demo document..."
-          cat > "$TEX_FILE" << 'DEMO_EOF'
+      # ── 1. Flask secret_key persistent erzeugen ──────────────────────────────
+      if [ ! -f /etc/weblatex/flask_secret ]; then
+          python3 -c "import os; open('/etc/weblatex/flask_secret','wb').write(os.urandom(32))"
+          chown root:www-data /etc/weblatex/flask_secret
+          chmod 640 /etc/weblatex/flask_secret
+      fi
+
+      # ── 2. Pro User Verzeichnis + Startdokumente anlegen ─────────────────────
+      for envfile in /etc/weblatex/users/*.env; do
+          [ -f "$envfile" ] || continue
+
+          EMAIL=""
+          while IFS='=' read -r key val; do
+              case "$key" in
+                  EMAIL) EMAIL="$val" ;;
+              esac
+          done < "$envfile"
+          [ -z "$EMAIL" ] && continue
+
+          UNAME=$(echo "$EMAIL" | sed 's/@/_/;s/\./-/g')
+          UDIR="$BASE_DIR/$UNAME"
+          mkdir -p "$UDIR"
+
+          # assignment_files verarbeiten
+          if [ -d /tmp/assignment ] && [ "$(ls -A /tmp/assignment 2>/dev/null)" ]; then
+              for srcfile in /tmp/assignment/*; do
+                  fname=$(basename "$srcfile")
+                  if echo "$fname" | grep -qi '\.zip$'; then
+                      # ZIP entpacken
+                      unzip -o "$srcfile" -d "$UDIR" > /tmp/unzip_"$UNAME".log 2>&1 || \
+                          echo "$LOG WARNING: unzip failed for $fname"
+                  else
+                      cp "$srcfile" "$UDIR/$fname"
+                  fi
+              done
+          fi
+
+          # Fallback: Demo-Dokument wenn kein master.tex vorhanden
+          if [ ! -f "$UDIR/master.tex" ]; then
+              cat > "$UDIR/master.tex" << 'DEMO_EOF'
       \documentclass{article}
       \usepackage[utf8]{inputenc}
       \usepackage[T1]{fontenc}
-
       \title{Web-LaTeX Editor}
       \author{AppStore}
       \date{\today}
-
       \begin{document}
       \maketitle
-
       \section{Willkommen}
-      Dies ist das Demo-Dokument. Du kannst es direkt im Editor bearbeiten
-      und mit \textbf{Ctrl+Enter} (oder dem Kompilieren-Button) neu übersetzen.
-
-      \section{Beispiel}
-      Eine einfache Liste:
-      \begin{itemize}
-        \item Erster Punkt
-        \item Zweiter Punkt
-        \item Dritter Punkt
-      \end{itemize}
-
+      Dies ist das Demo-Dokument. Bearbeite es im Editor und kompiliere mit Ctrl+Enter.
       \end{document}
       DEMO_EOF
-      fi
-      chown www-data:www-data "$TEX_FILE"
+          fi
 
-      # ── 2. Erstes PDF vorab kompilieren ───────────────────────────────────────
-      echo "$LOG STEP 2: Pre-compiling initial PDF..."
-      pdflatex -interaction=nonstopmode -output-directory="$OUT_DIR" "$TEX_FILE" > /tmp/pdflatex.log 2>&1 || true
-      pdflatex -interaction=nonstopmode -output-directory="$OUT_DIR" "$TEX_FILE" >> /tmp/pdflatex.log 2>&1 || true
-      rm -f "$OUT_DIR"/*.aux "$OUT_DIR"/*.log "$OUT_DIR"/*.out "$OUT_DIR"/*.toc 2>/dev/null || true
-      chown -R www-data:www-data "$OUT_DIR"
+          chown -R www-data:www-data "$UDIR"
 
-      if [ -f "$OUT_DIR/document.pdf" ]; then
-          echo "$LOG Initial PDF compiled successfully"
-      else
-          echo "$LOG WARNING: Initial PDF compilation failed — editor still works"
-      fi
+          # Vorab-Kompilierung
+          su -s /bin/bash www-data -c \
+              "pdflatex -interaction=nonstopmode -output-directory='$UDIR' '$UDIR/master.tex'" \
+              > /tmp/pdflatex_"$UNAME".log 2>&1 || true
+      done
+
+      # Aufräumen
+      rm -rf /tmp/assignment
 
       # ── 3. Services starten ───────────────────────────────────────────────────
       echo "$LOG STEP 3: Starting services..."
       systemctl start weblatex
       systemctl enable weblatex
 
-      # Warten bis Flask bereit
       for i in $(seq 1 30); do
           curl -sf http://127.0.0.1:5000/ > /dev/null 2>&1 && echo "$LOG Flask ready." && break
           sleep 2
@@ -96,11 +113,9 @@ write_files:
 
       systemctl restart nginx
 
-      # ── 4. Health check ───────────────────────────────────────────────────────
       HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" http://localhost/ || echo "000")
       echo "[weblatex-test] HTTP status: $HTTP_CODE (expected 200)"
-
-      echo "$LOG All steps done. Editor available at http://$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')/"
+      echo "$LOG All steps done."
 
 runcmd:
   - bash /usr/local/bin/weblatex-provision.sh

@@ -21,7 +21,8 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   nginx \
   python3 \
   python3-flask \
-  python3-pip
+  python3-pip \
+  unzip
 
 echo "[3/6] Creating Flask app..."
 sudo mkdir -p /opt/weblatex/templates
@@ -34,21 +35,43 @@ from functools import wraps
 from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for
 
 app = Flask(__name__)
-app.secret_key = os.urandom(32)
 
-WORK_DIR = '/var/www/weblatex'
-TEX_FILE = os.path.join(WORK_DIR, 'document.tex')
-CREDS_FILE = '/etc/weblatex/credentials.env'
+# Persistent secret key — kein Session-Verlust bei Service-Restart
+_secret_path = '/etc/weblatex/flask_secret'
+if os.path.exists(_secret_path):
+    with open(_secret_path, 'rb') as _f:
+        app.secret_key = _f.read()
+else:
+    app.secret_key = os.urandom(32)
+
+BASE_DIR = '/var/www/weblatex'
+USERS_DIR = '/etc/weblatex/users'
+
+def email_to_dirname(email):
+    return email.replace('@', '_').replace('.', '-')
+
+def get_user_dir(email):
+    return os.path.join(BASE_DIR, email_to_dirname(email))
 
 def load_credentials():
     creds = {}
-    if os.path.exists(CREDS_FILE):
-        with open(CREDS_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if '=' in line and not line.startswith('#'):
-                    k, v = line.split('=', 1)
-                    creds[k.strip()] = v.strip()
+    if not os.path.isdir(USERS_DIR):
+        return creds
+    for fname in os.listdir(USERS_DIR):
+        if not fname.endswith('.env'):
+            continue
+        try:
+            user_data = {}
+            with open(os.path.join(USERS_DIR, fname)) as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.split('=', 1)
+                        user_data[k.strip()] = v.strip()
+            if 'EMAIL' in user_data and 'PASSWORD' in user_data:
+                creds[user_data['EMAIL']] = user_data['PASSWORD']
+        except (OSError, PermissionError):
+            continue
     return creds
 
 def login_required(f):
@@ -71,9 +94,7 @@ def do_login():
     creds = load_credentials()
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
-    expected_user = creds.get('USERNAME', '')
-    expected_pass = creds.get('PASSWORD', '')
-    if username == expected_user and password == expected_pass:
+    if username in creds and creds[username] == password:
         session['logged_in'] = True
         session['username'] = username
         return redirect(url_for('index'))
@@ -87,35 +108,43 @@ def logout():
 @app.route('/')
 @login_required
 def index():
+    user_dir = get_user_dir(session['username'])
+    os.makedirs(user_dir, exist_ok=True)
+    master = os.path.join(user_dir, 'master.tex')
     content = ''
-    if os.path.exists(TEX_FILE):
-        with open(TEX_FILE, 'r') as f:
+    if os.path.exists(master):
+        with open(master, 'r') as f:
             content = f.read()
-    return render_template('index.html', content=content, username=session.get('username', ''))
+    return render_template('index.html', content=content, username=session['username'])
 
 @app.route('/compile', methods=['POST'])
 @login_required
 def compile_tex():
     data = request.get_json()
     tex_content = data.get('content', '')
-    os.makedirs(WORK_DIR, exist_ok=True)
-    with open(TEX_FILE, 'w') as f:
+    user_dir = get_user_dir(session['username'])
+    os.makedirs(user_dir, exist_ok=True)
+    master = os.path.join(user_dir, 'master.tex')
+    with open(master, 'w') as f:
         f.write(tex_content)
-    for aux in ['document.aux', 'document.log', 'document.out', 'document.toc']:
+    for ext in ['aux', 'log', 'out', 'toc']:
         try:
-            os.remove(os.path.join(WORK_DIR, aux))
+            os.remove(os.path.join(user_dir, 'master.' + ext))
         except FileNotFoundError:
             pass
+    # cwd=user_dir damit \input{} relativ aufgelöst wird
     result = subprocess.run(
-        ['pdflatex', '-interaction=nonstopmode', '-output-directory', WORK_DIR, TEX_FILE],
+        ['pdflatex', '-interaction=nonstopmode', '-output-directory', user_dir, 'master.tex'],
+        cwd=user_dir,
         capture_output=True, text=True, timeout=60
     )
     if result.returncode == 0:
         subprocess.run(
-            ['pdflatex', '-interaction=nonstopmode', '-output-directory', WORK_DIR, TEX_FILE],
+            ['pdflatex', '-interaction=nonstopmode', '-output-directory', user_dir, 'master.tex'],
+            cwd=user_dir,
             capture_output=True, text=True, timeout=60
         )
-    pdf_path = os.path.join(WORK_DIR, 'document.pdf')
+    pdf_path = os.path.join(user_dir, 'master.pdf')
     if os.path.exists(pdf_path):
         return jsonify({'success': True})
     log = result.stdout + result.stderr
@@ -125,7 +154,8 @@ def compile_tex():
 @app.route('/document.pdf')
 @login_required
 def get_pdf():
-    pdf_path = os.path.join(WORK_DIR, 'document.pdf')
+    user_dir = get_user_dir(session['username'])
+    pdf_path = os.path.join(user_dir, 'master.pdf')
     if os.path.exists(pdf_path):
         return send_file(pdf_path, mimetype='application/pdf')
     return 'No PDF available', 404
@@ -163,13 +193,13 @@ sudo tee /opt/weblatex/templates/login.html > /dev/null << 'LOGINEOF'
 <body>
   <div class="card">
     <h1>Web-LaTeX Editor</h1>
-    <p>Bitte melde dich mit deinen Team-Zugangsdaten an.</p>
+    <p>Bitte melde dich mit deinen Zugangsdaten an.</p>
     {% if error %}
     <div class="error">Benutzername oder Passwort falsch.</div>
     {% endif %}
     <form method="POST" action="/login">
-      <label for="username">Benutzername</label>
-      <input type="text" id="username" name="username" autocomplete="username" required>
+      <label for="username">E-Mail</label>
+      <input type="email" id="username" name="username" autocomplete="username" required>
       <label for="password">Passwort</label>
       <input type="password" id="password" name="password" autocomplete="current-password" required>
       <button type="submit">Anmelden</button>
@@ -199,6 +229,7 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     .btn-logout { background: transparent; color: #6c7086; border: 1px solid #45475a; margin-left: auto; }
     .btn-logout:hover { color: #f38ba8; border-color: #f38ba8; }
     .user-info { font-size: 0.8rem; color: #6c7086; }
+    .status { font-size: 0.85rem; }
     .status.ok { color: #a6e3a1; }
     .status.err { color: #f38ba8; }
     .status.compiling { color: #fab387; }
@@ -241,7 +272,6 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
       autofocus: true,
       extraKeys: { 'Ctrl-Enter': compile, 'Cmd-Enter': compile }
     });
-    // Editor füllt die gesamte Höhe
     editor.setSize('100%', '100%');
 
     async function compile() {
@@ -249,12 +279,10 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
       const status = document.getElementById('status');
       const errorBox = document.getElementById('errorBox');
       const errorText = document.getElementById('errorText');
-
       btn.disabled = true;
       status.className = 'status compiling';
       status.textContent = 'Kompiliert...';
       errorBox.style.display = 'none';
-
       try {
         const res = await fetch('/compile', {
           method: 'POST',
@@ -262,7 +290,6 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
           body: JSON.stringify({ content: editor.getValue() })
         });
         const data = await res.json();
-
         if (data.success) {
           status.className = 'status ok';
           status.textContent = '✓ Erfolgreich';
@@ -305,9 +332,9 @@ WantedBy=multi-user.target
 SVCEOF
 
 sudo chown -R www-data:www-data /opt/weblatex /var/www/weblatex
-sudo mkdir -p /etc/weblatex
-sudo chown root:www-data /etc/weblatex
-sudo chmod 750 /etc/weblatex
+sudo mkdir -p /etc/weblatex/users
+sudo chown root:www-data /etc/weblatex /etc/weblatex/users
+sudo chmod 750 /etc/weblatex /etc/weblatex/users
 sudo systemctl daemon-reload
 sudo systemctl enable weblatex
 
@@ -317,20 +344,11 @@ server {
     listen 80 default_server;
     server_name _;
 
-    # PDF direkt ausliefern (statisch)
-    location /document.pdf {
-        root /var/www/weblatex;
-        add_header Content-Disposition inline;
-        add_header Content-Type application/pdf;
-    }
-
-    # Alles andere geht an Flask
     location / {
         proxy_pass http://127.0.0.1:5000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        # Großes Request-Body für lange .tex-Dokumente
-        client_max_body_size 2M;
+        client_max_body_size 5M;
     }
 }
 NGINXEOF
@@ -342,7 +360,6 @@ echo "Cleanup..."
 sudo apt-get clean
 sudo rm -rf /var/lib/apt/lists/*
 
-# Reset machine-id
 sudo truncate -s 0 /etc/machine-id
 sudo rm -f /var/lib/dbus/machine-id
 
