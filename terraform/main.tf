@@ -91,7 +91,7 @@ resource "openstack_compute_instance_v2" "team_vm" {
   name        = "${local.app_name}-${each.key}"
   image_id    = data.openstack_images_image_v2.image.id
   flavor_name = local.flavor
-  key_pair    = null
+  key_pair    = var.key_pair != "" ? var.key_pair : null
 
   timeouts {
     create = "15m"
@@ -104,6 +104,8 @@ resource "openstack_compute_instance_v2" "team_vm" {
 
   user_data = templatefile("${path.module}/user-data.yaml.tpl", {
     latex_document = var.latex_document
+    team_username  = local.team_account_email[each.key]
+    team_password  = random_password.team_passwords[each.key].result
   })
 
   metadata = {

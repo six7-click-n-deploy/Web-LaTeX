@@ -30,57 +30,100 @@ sudo mkdir -p /var/www/weblatex
 sudo tee /opt/weblatex/app.py > /dev/null << 'PYEOF'
 import os
 import subprocess
-import tempfile
-from flask import Flask, request, jsonify, send_file, render_template
+from functools import wraps
+from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for
 
 app = Flask(__name__)
+app.secret_key = os.urandom(32)
+
 WORK_DIR = '/var/www/weblatex'
 TEX_FILE = os.path.join(WORK_DIR, 'document.tex')
+CREDS_FILE = '/etc/weblatex/credentials.env'
+
+def load_credentials():
+    creds = {}
+    if os.path.exists(CREDS_FILE):
+        with open(CREDS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    creds[k.strip()] = v.strip()
+    return creds
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/login', methods=['GET'])
+def login_page():
+    if session.get('logged_in'):
+        return redirect(url_for('index'))
+    error = request.args.get('error')
+    return render_template('login.html', error=error)
+
+@app.route('/login', methods=['POST'])
+def do_login():
+    creds = load_credentials()
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '').strip()
+    expected_user = creds.get('USERNAME', '')
+    expected_pass = creds.get('PASSWORD', '')
+    if username == expected_user and password == expected_pass:
+        session['logged_in'] = True
+        session['username'] = username
+        return redirect(url_for('index'))
+    return redirect(url_for('login_page', error='1'))
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login_page'))
 
 @app.route('/')
+@login_required
 def index():
     content = ''
     if os.path.exists(TEX_FILE):
         with open(TEX_FILE, 'r') as f:
             content = f.read()
-    return render_template('index.html', content=content)
+    return render_template('index.html', content=content, username=session.get('username', ''))
 
 @app.route('/compile', methods=['POST'])
+@login_required
 def compile_tex():
     data = request.get_json()
     tex_content = data.get('content', '')
-
     os.makedirs(WORK_DIR, exist_ok=True)
     with open(TEX_FILE, 'w') as f:
         f.write(tex_content)
-
     for aux in ['document.aux', 'document.log', 'document.out', 'document.toc']:
         try:
             os.remove(os.path.join(WORK_DIR, aux))
         except FileNotFoundError:
             pass
-
     result = subprocess.run(
         ['pdflatex', '-interaction=nonstopmode', '-output-directory', WORK_DIR, TEX_FILE],
         capture_output=True, text=True, timeout=60
     )
-    # Zweiter Lauf für Referenzen
     if result.returncode == 0:
         subprocess.run(
             ['pdflatex', '-interaction=nonstopmode', '-output-directory', WORK_DIR, TEX_FILE],
             capture_output=True, text=True, timeout=60
         )
-
     pdf_path = os.path.join(WORK_DIR, 'document.pdf')
     if os.path.exists(pdf_path):
         return jsonify({'success': True})
-    else:
-        log = result.stdout + result.stderr
-        # Relevante Fehlerzeilen herausfiltern
-        errors = [l for l in log.splitlines() if l.startswith('!') or 'Error' in l]
-        return jsonify({'success': False, 'errors': errors[:20]})
+    log = result.stdout + result.stderr
+    errors = [l for l in log.splitlines() if l.startswith('!') or 'Error' in l]
+    return jsonify({'success': False, 'errors': errors[:20]})
 
 @app.route('/document.pdf')
+@login_required
 def get_pdf():
     pdf_path = os.path.join(WORK_DIR, 'document.pdf')
     if os.path.exists(pdf_path):
@@ -91,7 +134,51 @@ if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000)
 PYEOF
 
-echo "[4/6] Creating HTML template..."
+echo "[4/6] Creating HTML templates..."
+sudo tee /opt/weblatex/templates/login.html > /dev/null << 'LOGINEOF'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Web-LaTeX — Login</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4;
+           display: flex; align-items: center; justify-content: center; height: 100vh; }
+    .card { background: #181825; border: 1px solid #313244; border-radius: 10px;
+            padding: 40px; width: 360px; }
+    h1 { color: #cba6f7; font-size: 1.4rem; margin-bottom: 8px; }
+    p  { color: #6c7086; font-size: 0.85rem; margin-bottom: 28px; }
+    label { display: block; font-size: 0.85rem; color: #a6adc8; margin-bottom: 6px; }
+    input { width: 100%; padding: 10px 12px; background: #313244; border: 1px solid #45475a;
+            border-radius: 6px; color: #cdd6f4; font-size: 0.95rem; margin-bottom: 16px; }
+    input:focus { outline: none; border-color: #cba6f7; }
+    button { width: 100%; padding: 11px; background: #cba6f7; color: #1e1e2e;
+             font-weight: 700; font-size: 1rem; border: none; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #b4befe; }
+    .error { background: #3b1b1b; color: #f38ba8; border-radius: 6px;
+             padding: 10px 14px; font-size: 0.85rem; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Web-LaTeX Editor</h1>
+    <p>Bitte melde dich mit deinen Team-Zugangsdaten an.</p>
+    {% if error %}
+    <div class="error">Benutzername oder Passwort falsch.</div>
+    {% endif %}
+    <form method="POST" action="/login">
+      <label for="username">Benutzername</label>
+      <input type="text" id="username" name="username" autocomplete="username" required>
+      <label for="password">Passwort</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+      <button type="submit">Anmelden</button>
+    </form>
+  </div>
+</body>
+</html>
+LOGINEOF
+
 sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
 <!DOCTYPE html>
 <html lang="de">
@@ -109,7 +196,9 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     .btn-compile { background: #a6e3a1; color: #1e1e2e; }
     .btn-compile:hover { background: #94e2d5; }
     .btn-compile:disabled { background: #45475a; color: #6c7086; cursor: not-allowed; }
-    .status { font-size: 0.85rem; margin-left: auto; }
+    .btn-logout { background: transparent; color: #6c7086; border: 1px solid #45475a; margin-left: auto; }
+    .btn-logout:hover { color: #f38ba8; border-color: #f38ba8; }
+    .user-info { font-size: 0.8rem; color: #6c7086; }
     .status.ok { color: #a6e3a1; }
     .status.err { color: #f38ba8; }
     .status.compiling { color: #fab387; }
@@ -128,6 +217,8 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     <h1>Web-LaTeX Editor</h1>
     <button class="btn btn-compile" id="compileBtn" onclick="compile()">▶ Kompilieren</button>
     <span class="status" id="status"></span>
+    <span class="user-info">{{ username }}</span>
+    <a href="/logout" class="btn btn-logout">Abmelden</a>
   </header>
   <main>
     <div class="editor-pane">
@@ -214,6 +305,9 @@ WantedBy=multi-user.target
 SVCEOF
 
 sudo chown -R www-data:www-data /opt/weblatex /var/www/weblatex
+sudo mkdir -p /etc/weblatex
+sudo chown root:www-data /etc/weblatex
+sudo chmod 750 /etc/weblatex
 sudo systemctl daemon-reload
 sudo systemctl enable weblatex
 

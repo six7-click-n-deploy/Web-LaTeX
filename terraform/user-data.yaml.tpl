@@ -1,5 +1,9 @@
 #cloud-config
 
+bootcmd:
+  - mkdir -p /etc/weblatex
+  - chmod 750 /etc/weblatex
+
 write_files:
 %{ if latex_document != "" ~}
   - path: /tmp/document.tex.b64
@@ -8,6 +12,13 @@ write_files:
     encoding: b64
     content: ${latex_document}
 %{ endif ~}
+
+  - path: /etc/weblatex/credentials.env
+    permissions: '0640'
+    owner: root:www-data
+    content: |
+      USERNAME=${team_username}
+      PASSWORD=${team_password}
 
   - path: /usr/local/bin/weblatex-provision.sh
     permissions: '0700'

@@ -16,8 +16,12 @@ variable "latex_document" {
   default     = ""
 }
 
-############################
-# BACKEND-Variablen (vom AppStore/Platform-Team gesetzt)
+variable "key_pair" {
+  description = "[BACKEND] OpenStack Keypair Name für SSH-Zugang (optional)"
+  type        = string
+  default     = ""
+}
+
 ############################
 
 variable "image_name" {
