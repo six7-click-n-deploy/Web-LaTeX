@@ -22,11 +22,61 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   python3 \
   python3-flask \
   python3-pip \
-  unzip
+  unzip \
+  zip
 
 echo "[3/6] Creating Flask app..."
 sudo mkdir -p /opt/weblatex/templates
 sudo mkdir -p /var/www/weblatex
+
+# Demo-Projekt als ZIP im Image ablegen
+DEMO_TMP=$(mktemp -d)
+mkdir -p "$DEMO_TMP/chapters"
+
+sudo tee "$DEMO_TMP/master.tex" > /dev/null << 'DEMO_MASTER'
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+
+\title{Web-LaTeX Editor}
+\author{AppStore}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\input{chapters/intro}
+\input{chapters/example}
+
+\end{document}
+DEMO_MASTER
+
+sudo tee "$DEMO_TMP/chapters/intro.tex" > /dev/null << 'DEMO_INTRO'
+\section{Willkommen}
+Dies ist das Demo-Projekt. Jeder Abschnitt liegt in einer eigenen Datei
+im Verzeichnis \texttt{chapters/}.
+
+Bearbeite \texttt{master.tex} im Editor und kompiliere mit \textbf{Ctrl+Enter}.
+DEMO_INTRO
+
+sudo tee "$DEMO_TMP/chapters/example.tex" > /dev/null << 'DEMO_EXAMPLE'
+\section{Beispiel}
+Eine einfache Liste:
+\begin{itemize}
+  \item \texttt{master.tex} -- Einstiegspunkt, bindet alle Kapitel ein
+  \item \texttt{chapters/intro.tex} -- Einleitung
+  \item \texttt{chapters/example.tex} -- Dieser Abschnitt
+\end{itemize}
+
+Eine Formel: $E = mc^2$
+DEMO_EXAMPLE
+
+(cd "$DEMO_TMP" && sudo zip -r /opt/weblatex/demo_project.zip .)
+rm -rf "$DEMO_TMP"
+sudo chown www-data:www-data /opt/weblatex/demo_project.zip
 
 sudo tee /opt/weblatex/app.py > /dev/null << 'PYEOF'
 import os
@@ -127,7 +177,8 @@ def compile_tex():
     master = os.path.join(user_dir, 'master.tex')
     with open(master, 'w') as f:
         f.write(tex_content)
-    for ext in ['aux', 'log', 'out', 'toc']:
+    # Alte Hilfsdateien und PDF löschen damit success:true nur bei echtem PDF gilt
+    for ext in ['aux', 'log', 'out', 'toc', 'pdf']:
         try:
             os.remove(os.path.join(user_dir, 'master.' + ext))
         except FileNotFoundError:
@@ -151,7 +202,45 @@ def compile_tex():
     errors = [l for l in log.splitlines() if l.startswith('!') or 'Error' in l]
     return jsonify({'success': False, 'errors': errors[:20]})
 
-@app.route('/document.pdf')
+@app.route('/files')
+@login_required
+def list_files():
+    user_dir = get_user_dir(session['username'])
+    files = []
+    for root, dirs, fnames in os.walk(user_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+        for fname in sorted(fnames):
+            if fname.endswith('.tex'):
+                rel = os.path.relpath(os.path.join(root, fname), user_dir)
+                files.append(rel)
+    return jsonify(files)
+
+@app.route('/file/<path:relpath>', methods=['GET'])
+@login_required
+def get_file(relpath):
+    user_dir = get_user_dir(session['username'])
+    full = os.path.realpath(os.path.join(user_dir, relpath))
+    if not full.startswith(os.path.realpath(user_dir)):
+        return 'Forbidden', 403
+    if not os.path.exists(full):
+        return 'Not found', 404
+    with open(full, 'r') as f:
+        return jsonify({'content': f.read()})
+
+@app.route('/file/<path:relpath>', methods=['POST'])
+@login_required
+def save_file(relpath):
+    user_dir = get_user_dir(session['username'])
+    full = os.path.realpath(os.path.join(user_dir, relpath))
+    if not full.startswith(os.path.realpath(user_dir)):
+        return 'Forbidden', 403
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    data = request.get_json()
+    with open(full, 'w') as f:
+        f.write(data.get('content', ''))
+    return jsonify({'success': True})
+
+@app.route('/pdf')
 @login_required
 def get_pdf():
     user_dir = get_user_dir(session['username'])
@@ -220,7 +309,7 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4; height: 100vh; display: flex; flex-direction: column; }
-    header { padding: 10px 20px; background: #181825; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #313244; }
+    header { padding: 10px 20px; background: #181825; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #313244; flex-shrink: 0; }
     header h1 { font-size: 1.1rem; color: #cba6f7; }
     .btn { padding: 8px 18px; border: none; border-radius: 5px; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
     .btn-compile { background: #a6e3a1; color: #1e1e2e; }
@@ -234,10 +323,19 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     .status.err { color: #f38ba8; }
     .status.compiling { color: #fab387; }
     main { display: flex; flex: 1; overflow: hidden; }
-    .editor-pane { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #313244; }
+    /* Sidebar */
+    .sidebar { width: 180px; background: #181825; border-right: 1px solid #313244; display: flex; flex-direction: column; flex-shrink: 0; }
+    .sidebar-header { padding: 8px 12px; font-size: 0.75rem; color: #6c7086; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #313244; }
+    .file-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+    .file-item { padding: 6px 12px; font-size: 0.82rem; cursor: pointer; color: #a6adc8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-item:hover { background: #313244; color: #cdd6f4; }
+    .file-item.active { background: #313244; color: #cba6f7; font-weight: 600; }
+    /* Editor */
+    .editor-pane { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #313244; min-width: 0; }
     .editor-pane .CodeMirror { flex: 1; height: 100%; font-size: 13px; line-height: 1.6; }
     .editor-pane .CodeMirror-scroll { height: 100%; }
-    .preview-pane { flex: 1; background: #181825; display: flex; flex-direction: column; }
+    /* Preview */
+    .preview-pane { flex: 1; background: #181825; display: flex; flex-direction: column; min-width: 0; }
     .preview-pane iframe { flex: 1; border: none; background: white; }
     .error-box { padding: 16px; background: #302030; color: #f38ba8; font-family: monospace; font-size: 0.8rem; overflow-y: auto; max-height: 200px; }
     .error-box pre { white-space: pre-wrap; }
@@ -252,11 +350,15 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     <a href="/logout" class="btn btn-logout">Abmelden</a>
   </header>
   <main>
+    <div class="sidebar">
+      <div class="sidebar-header">Dateien</div>
+      <div class="file-list" id="fileList"></div>
+    </div>
     <div class="editor-pane">
       <textarea id="editor">{{ content }}</textarea>
     </div>
     <div class="preview-pane">
-      <iframe id="preview" src="/document.pdf"></iframe>
+      <iframe id="preview" src="/pdf"></iframe>
       <div class="error-box" id="errorBox" style="display:none"><pre id="errorText"></pre></div>
     </div>
   </main>
@@ -274,7 +376,57 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     });
     editor.setSize('100%', '100%');
 
+    // Datei-Cache: ungespeicherte Änderungen pro Datei merken
+    const fileCache = {};
+    let currentFile = 'master.tex';
+
+    async function loadFileList() {
+      const res = await fetch('/files');
+      const files = await res.json();
+      const list = document.getElementById('fileList');
+      list.innerHTML = '';
+      files.forEach(f => {
+        const item = document.createElement('div');
+        item.className = 'file-item' + (f === currentFile ? ' active' : '');
+        item.textContent = f;
+        item.title = f;
+        item.onclick = () => switchFile(f);
+        list.appendChild(item);
+      });
+    }
+
+    async function switchFile(filename) {
+      // Aktuellen Stand im Cache speichern
+      fileCache[currentFile] = editor.getValue();
+      // Aktiven Eintrag wechseln
+      document.querySelectorAll('.file-item').forEach(el => {
+        el.classList.toggle('active', el.textContent === filename);
+      });
+      currentFile = filename;
+      // Aus Cache laden oder vom Server holen
+      if (fileCache[filename] !== undefined) {
+        editor.setValue(fileCache[filename]);
+      } else {
+        const res = await fetch('/file/' + filename);
+        const data = await res.json();
+        editor.setValue(data.content);
+        fileCache[filename] = data.content;
+      }
+      editor.focus();
+    }
+
+    async function saveCurrentFile() {
+      await fetch('/file/' + currentFile, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: editor.getValue() })
+      });
+      fileCache[currentFile] = editor.getValue();
+    }
+
     async function compile() {
+      // Aktuelle Datei speichern bevor kompiliert wird
+      await saveCurrentFile();
       const btn = document.getElementById('compileBtn');
       const status = document.getElementById('status');
       const errorBox = document.getElementById('errorBox');
@@ -284,16 +436,20 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
       status.textContent = 'Kompiliert...';
       errorBox.style.display = 'none';
       try {
+        // master.tex Inhalt aus Cache oder Server holen
+        const masterContent = fileCache['master.tex'] !== undefined
+          ? fileCache['master.tex']
+          : await fetch('/file/master.tex').then(r => r.json()).then(d => d.content);
         const res = await fetch('/compile', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: editor.getValue() })
+          body: JSON.stringify({ content: masterContent })
         });
         const data = await res.json();
         if (data.success) {
           status.className = 'status ok';
           status.textContent = '✓ Erfolgreich';
-          document.getElementById('preview').src = '/document.pdf?t=' + Date.now();
+          document.getElementById('preview').src = '/pdf?t=' + Date.now();
           errorBox.style.display = 'none';
         } else {
           status.className = 'status err';
@@ -308,6 +464,9 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
         btn.disabled = false;
       }
     }
+
+    // Beim Start Dateiliste laden
+    loadFileList();
   </script>
 </body>
 </html>
@@ -335,6 +494,9 @@ sudo chown -R www-data:www-data /opt/weblatex /var/www/weblatex
 sudo mkdir -p /etc/weblatex/users
 sudo chown root:www-data /etc/weblatex /etc/weblatex/users
 sudo chmod 750 /etc/weblatex /etc/weblatex/users
+sudo python3 -c "import os; open('/etc/weblatex/flask_secret','wb').write(os.urandom(32))"
+sudo chown root:www-data /etc/weblatex/flask_secret
+sudo chmod 640 /etc/weblatex/flask_secret
 sudo systemctl daemon-reload
 sudo systemctl enable weblatex
 

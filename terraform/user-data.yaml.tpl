@@ -73,36 +73,28 @@ write_files:
               done
           fi
 
-          # Fallback: Demo-Dokument wenn kein master.tex vorhanden
+          # assignment_files leer → Demo-ZIP aus dem Image entpacken
           if [ ! -f "$UDIR/master.tex" ]; then
-              cat > "$UDIR/master.tex" << 'DEMO_EOF'
-      \documentclass{article}
-      \usepackage[utf8]{inputenc}
-      \usepackage[T1]{fontenc}
-      \title{Web-LaTeX Editor}
-      \author{AppStore}
-      \date{\today}
-      \begin{document}
-      \maketitle
-      \section{Willkommen}
-      Dies ist das Demo-Dokument. Bearbeite es im Editor und kompiliere mit Ctrl+Enter.
-      \end{document}
-      DEMO_EOF
+              unzip -o /opt/weblatex/demo_project.zip -d "$UDIR" > /tmp/unzip_demo_"$UNAME".log 2>&1 || \
+                  echo "$LOG WARNING: demo unzip failed for $UNAME"
           fi
 
           chown -R www-data:www-data "$UDIR"
 
-          # Vorab-Kompilierung
-          su -s /bin/bash www-data -c \
-              "pdflatex -interaction=nonstopmode -output-directory='$UDIR' '$UDIR/master.tex'" \
-              > /tmp/pdflatex_"$UNAME".log 2>&1 || true
+          # Vorab-Kompilierung (zweimal für TOC/Referenzen)
+          pdflatex -interaction=nonstopmode -output-directory="$UDIR" "$UDIR/master.tex" \
+              > /tmp/pdflatex_"$UNAME"_1.log 2>&1 || true
+          pdflatex -interaction=nonstopmode -output-directory="$UDIR" "$UDIR/master.tex" \
+              > /tmp/pdflatex_"$UNAME"_2.log 2>&1 || true
+          rm -f "$UDIR"/*.aux "$UDIR"/*.log "$UDIR"/*.out "$UDIR"/*.toc 2>/dev/null || true
+          chown -R www-data:www-data "$UDIR"
       done
 
       # Aufräumen
       rm -rf /tmp/assignment
 
-      # ── 3. Services starten ───────────────────────────────────────────────────
-      echo "$LOG STEP 3: Starting services..."
+      # ── 1. Services starten ───────────────────────────────────────────────────
+      echo "$LOG STEP 1: Starting services..."
       systemctl start weblatex
       systemctl enable weblatex
 
@@ -111,7 +103,8 @@ write_files:
           sleep 2
       done
 
-      systemctl restart nginx
+      # nginx nur laden (kein restart — restart zerstört Flask-Sessions nicht, aber reload reicht)
+      systemctl reload nginx || systemctl start nginx
 
       HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" http://localhost/ || echo "000")
       echo "[weblatex-test] HTTP status: $HTTP_CODE (expected 200)"
