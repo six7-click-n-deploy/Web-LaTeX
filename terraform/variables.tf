@@ -38,7 +38,7 @@ variable "image_name" {
 }
 
 variable "network_uuid" {
-  description = "[BACKEND] UUID des internen Netzwerks (von Platform-Admin konfiguriert) @openstack:network:id"
+  description = "[BACKEND] UUID des internen Netzwerks (von Platform-Admin konfiguriert) @openstack:network:name"
   type        = string
   default     = "34a00b87-57ce-42c4-8e1b-9ea8a657ec2e"
 }
@@ -50,7 +50,7 @@ variable "floating_ip_pool" {
 }
 
 variable "shared_secgroup_id" {
-  description = "[BACKEND] ID der gemeinsamen Security Group für alle VMs @openstack:security_group:id"
+  description = "[BACKEND] ID der gemeinsamen Security Group für alle VMs @openstack:security_group:name"
   type        = string
   default     = "4ffaf007-df66-4250-9118-1bd99378d34a"
 }
