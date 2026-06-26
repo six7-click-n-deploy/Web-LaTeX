@@ -12,3 +12,8 @@ packer_cache/
 
 # OS files
 .DS_Store
+
+# Test assignment files
+Team1/
+Team2/
+*.zip
