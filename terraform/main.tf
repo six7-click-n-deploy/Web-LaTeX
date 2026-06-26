@@ -103,7 +103,7 @@ resource "openstack_compute_instance_v2" "team_vm" {
       }
       if user.team == each.key
     ]
-    assignment_files = var.assignment_files
+    assignment_files = lookup(var.assignment_files, each.key, {})
   })
 
   metadata = {
