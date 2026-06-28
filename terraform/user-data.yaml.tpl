@@ -7,20 +7,21 @@ bootcmd:
 
 write_files:
 %{ if length(assignment_files) > 0 ~}
-  - path: /tmp/assignment/${assignment_files["uploaded"].name}
+%{ for _, file in assignment_files ~}
+  - path: /tmp/assignment/${file.name}
     permissions: '0644'
     owner: root:root
     encoding: b64
-    content: ${assignment_files["uploaded"].content_b64}
+    content: ${file.content_b64}
+%{ endfor ~}
 %{ endif ~}
 
 %{ for user in team_users ~}
   - path: /etc/weblatex/users/${replace(replace(user.email, "@", "_at_"), ".", "-")}.env
     permissions: '0640'
     owner: root:www-data
-    content: |
-      EMAIL=${user.email}
-      PASSWORD=${user.password}
+    encoding: b64
+    content: ${base64encode("EMAIL=${user.email}\nPASSWORD=${user.password}\n")}
 %{ endfor ~}
 
   - path: /usr/local/bin/weblatex-provision.sh

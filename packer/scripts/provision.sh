@@ -38,6 +38,7 @@ sudo tee "$DEMO_TMP/master.tex" > /dev/null << 'DEMO_MASTER'
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{hyperref}
+\usepackage{graphicx}
 
 \title{Web-LaTeX Editor}
 \author{AppStore}
@@ -112,7 +113,7 @@ def load_credentials():
             continue
         try:
             user_data = {}
-            with open(os.path.join(USERS_DIR, fname)) as f:
+            with open(os.path.join(USERS_DIR, fname), encoding='utf-8', errors='replace') as f:
                 for line in f:
                     line = line.strip()
                     if '=' in line and not line.startswith('#'):
@@ -163,57 +164,110 @@ def index():
     master = os.path.join(user_dir, 'master.tex')
     content = ''
     if os.path.exists(master):
-        with open(master, 'r') as f:
+        with open(master, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
     return render_template('index.html', content=content, username=session['username'])
 
 @app.route('/compile', methods=['POST'])
 @login_required
 def compile_tex():
-    data = request.get_json()
-    tex_content = data.get('content', '')
-    user_dir = get_user_dir(session['username'])
-    os.makedirs(user_dir, exist_ok=True)
-    master = os.path.join(user_dir, 'master.tex')
-    with open(master, 'w') as f:
-        f.write(tex_content)
-    # Alte Hilfsdateien und PDF löschen damit success:true nur bei echtem PDF gilt
-    for ext in ['aux', 'log', 'out', 'toc', 'pdf']:
-        try:
-            os.remove(os.path.join(user_dir, 'master.' + ext))
-        except FileNotFoundError:
-            pass
-    # cwd=user_dir damit \input{} relativ aufgelöst wird
-    result = subprocess.run(
-        ['pdflatex', '-interaction=nonstopmode', '-output-directory', user_dir, 'master.tex'],
-        cwd=user_dir,
-        capture_output=True, text=True, timeout=60
-    )
-    if result.returncode == 0:
-        subprocess.run(
+    try:
+        user_dir = get_user_dir(session['username'])
+        os.makedirs(user_dir, exist_ok=True)
+        master = os.path.join(user_dir, 'master.tex')
+        if not os.path.exists(master):
+            return jsonify({'success': False, 'errors': ['master.tex nicht gefunden']})
+        for ext in ['aux', 'log', 'out', 'toc', 'pdf']:
+            try:
+                os.remove(os.path.join(user_dir, 'master.' + ext))
+            except FileNotFoundError:
+                pass
+        result = subprocess.run(
             ['pdflatex', '-interaction=nonstopmode', '-output-directory', user_dir, 'master.tex'],
             cwd=user_dir,
-            capture_output=True, text=True, timeout=60
+            capture_output=True, timeout=60, encoding='latin-1'
         )
-    pdf_path = os.path.join(user_dir, 'master.pdf')
-    if os.path.exists(pdf_path):
-        return jsonify({'success': True})
-    log = result.stdout + result.stderr
-    errors = [l for l in log.splitlines() if l.startswith('!') or 'Error' in l]
-    return jsonify({'success': False, 'errors': errors[:20]})
+        if result.returncode == 0:
+            subprocess.run(
+                ['pdflatex', '-interaction=nonstopmode', '-output-directory', user_dir, 'master.tex'],
+                cwd=user_dir,
+                capture_output=True, timeout=60, encoding='latin-1'
+            )
+        pdf_path = os.path.join(user_dir, 'master.pdf')
+        if os.path.exists(pdf_path):
+            return jsonify({'success': True})
+        log = result.stdout + result.stderr
+        errors = [l for l in log.splitlines() if l.startswith('!') or 'Error' in l]
+        return jsonify({'success': False, 'errors': errors[:20]})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'errors': ['Kompilierung hat zu lange gedauert (Timeout 60s)']})
+    except Exception as e:
+        return jsonify({'success': False, 'errors': [str(e)]}), 500
 
 @app.route('/files')
 @login_required
 def list_files():
     user_dir = get_user_dir(session['username'])
-    files = []
+    tex_files = []
+    img_files = []
+    img_exts = {'.png', '.jpg', '.jpeg', '.gif'}
     for root, dirs, fnames in os.walk(user_dir):
         dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
         for fname in sorted(fnames):
+            rel = os.path.relpath(os.path.join(root, fname), user_dir)
+            ext = os.path.splitext(fname)[1].lower()
             if fname.endswith('.tex'):
-                rel = os.path.relpath(os.path.join(root, fname), user_dir)
-                files.append(rel)
-    return jsonify(files)
+                tex_files.append(rel)
+            elif ext in img_exts:
+                img_files.append(rel)
+    return jsonify({'tex': tex_files, 'images': img_files})
+
+@app.route('/new-file', methods=['POST'])
+@login_required
+def new_file():
+    data = request.get_json()
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Name fehlt'}), 400
+    if not name.endswith('.tex'):
+        name += '.tex'
+    # Sicherheitsprüfung: kein Path-Traversal
+    user_dir = get_user_dir(session['username'])
+    full = os.path.realpath(os.path.join(user_dir, name))
+    if not full.startswith(os.path.realpath(user_dir)):
+        return 'Forbidden', 403
+    if os.path.exists(full):
+        return jsonify({'error': 'Datei existiert bereits'}), 409
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, 'w', encoding='utf-8') as f:
+        f.write('')
+    return jsonify({'success': True, 'name': os.path.relpath(full, user_dir)})
+
+ALLOWED_IMG_EXTS = {'.png', '.jpg', '.jpeg', '.gif'}
+MAX_IMG_BYTES = 10 * 1024 * 1024  # 10 MB
+
+@app.route('/upload-image', methods=['POST'])
+@login_required
+def upload_image():
+    if 'file' not in request.files:
+        return jsonify({'error': 'Keine Datei'}), 400
+    f = request.files['file']
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ALLOWED_IMG_EXTS:
+        return jsonify({'error': f'Nur {", ".join(ALLOWED_IMG_EXTS)} erlaubt'}), 415
+    user_dir = get_user_dir(session['username'])
+    img_dir = os.path.join(user_dir, 'images')
+    os.makedirs(img_dir, exist_ok=True)
+    dest = os.path.realpath(os.path.join(img_dir, f.filename))
+    if not dest.startswith(os.path.realpath(img_dir)):
+        return 'Forbidden', 403
+    f.seek(0, 2)
+    size = f.tell()
+    f.seek(0)
+    if size > MAX_IMG_BYTES:
+        return jsonify({'error': 'Datei zu groß (max 10 MB)'}), 413
+    f.save(dest)
+    return jsonify({'success': True, 'name': os.path.relpath(dest, user_dir)})
 
 @app.route('/file/<path:relpath>', methods=['GET'])
 @login_required
@@ -224,7 +278,7 @@ def get_file(relpath):
         return 'Forbidden', 403
     if not os.path.exists(full):
         return 'Not found', 404
-    with open(full, 'r') as f:
+    with open(full, 'r', encoding='utf-8', errors='replace') as f:
         return jsonify({'content': f.read()})
 
 @app.route('/file/<path:relpath>', methods=['POST'])
@@ -236,7 +290,7 @@ def save_file(relpath):
         return 'Forbidden', 403
     os.makedirs(os.path.dirname(full), exist_ok=True)
     data = request.get_json()
-    with open(full, 'w') as f:
+    with open(full, 'w', encoding='utf-8') as f:
         f.write(data.get('content', ''))
     return jsonify({'success': True})
 
@@ -248,6 +302,17 @@ def get_pdf():
     if os.path.exists(pdf_path):
         return send_file(pdf_path, mimetype='application/pdf')
     return 'No PDF available', 404
+
+@app.route('/image/<path:relpath>')
+@login_required
+def get_image(relpath):
+    user_dir = get_user_dir(session['username'])
+    full = os.path.realpath(os.path.join(user_dir, relpath))
+    if not full.startswith(os.path.realpath(user_dir)):
+        return 'Forbidden', 403
+    if not os.path.exists(full):
+        return 'Not found', 404
+    return send_file(full)
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000)
@@ -307,38 +372,118 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
   <style>
+    :root {
+      --bg:       #0f1117;
+      --surface:  #161b22;
+      --border:   #21262d;
+      --muted:    #484f58;
+      --text:     #e6edf3;
+      --text-dim: #8b949e;
+      --accent:   #7c3aed;
+      --accent-h: #6d28d9;
+      --green:    #3fb950;
+      --red:      #f85149;
+      --amber:    #d29922;
+      --blue:     #58a6ff;
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4; height: 100vh; display: flex; flex-direction: column; }
-    header { padding: 10px 20px; background: #181825; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #313244; flex-shrink: 0; }
-    header h1 { font-size: 1.1rem; color: #cba6f7; }
-    .btn { padding: 8px 18px; border: none; border-radius: 5px; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
-    .btn-compile { background: #a6e3a1; color: #1e1e2e; }
-    .btn-compile:hover { background: #94e2d5; }
-    .btn-compile:disabled { background: #45475a; color: #6c7086; cursor: not-allowed; }
-    .btn-logout { background: transparent; color: #6c7086; border: 1px solid #45475a; margin-left: auto; }
-    .btn-logout:hover { color: #f38ba8; border-color: #f38ba8; }
-    .user-info { font-size: 0.8rem; color: #6c7086; }
-    .status { font-size: 0.85rem; }
-    .status.ok { color: #a6e3a1; }
-    .status.err { color: #f38ba8; }
-    .status.compiling { color: #fab387; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+
+    /* ── Header ── */
+    header { padding: 0 16px; height: 48px; background: var(--surface);
+             display: flex; align-items: center; gap: 10px;
+             border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    header h1 { font-size: 0.95rem; font-weight: 600; color: var(--text);
+                display: flex; align-items: center; gap: 6px; }
+    header h1::before { content: ''; display: inline-block; width: 8px; height: 8px;
+                        border-radius: 50%; background: var(--accent); }
+    .btn { padding: 6px 14px; border: none; border-radius: 6px; cursor: pointer;
+           font-size: 0.82rem; font-weight: 600; transition: background .15s; }
+    .btn-compile { background: var(--accent); color: #fff; }
+    .btn-compile:hover { background: var(--accent-h); }
+    .btn-compile:disabled { background: var(--muted); color: var(--text-dim); cursor: not-allowed; }
+    .btn-logout { background: transparent; color: var(--text-dim);
+                  border: 1px solid var(--border); margin-left: auto; }
+    .btn-logout:hover { color: var(--red); border-color: var(--red); }
+    .user-badge { font-size: 0.75rem; color: var(--text-dim);
+                  background: var(--border); padding: 3px 8px; border-radius: 20px; }
+    .status { font-size: 0.78rem; font-weight: 500; }
+    .status.ok      { color: var(--green); }
+    .status.err     { color: var(--red); }
+    .status.saving  { color: var(--amber); }
+
+    /* ── Layout ── */
     main { display: flex; flex: 1; overflow: hidden; }
-    /* Sidebar */
-    .sidebar { width: 180px; background: #181825; border-right: 1px solid #313244; display: flex; flex-direction: column; flex-shrink: 0; }
-    .sidebar-header { padding: 8px 12px; font-size: 0.75rem; color: #6c7086; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #313244; }
+
+    /* ── Sidebar ── */
+    .sidebar { width: 210px; background: var(--surface); border-right: 1px solid var(--border);
+               display: flex; flex-direction: column; flex-shrink: 0; }
+    .sidebar-header { padding: 8px 10px; font-size: 0.7rem; font-weight: 600;
+                      color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em;
+                      border-bottom: 1px solid var(--border);
+                      display: flex; align-items: center; justify-content: space-between; }
+    .sidebar-actions { display: flex; gap: 2px; }
+    .sidebar-actions button { background: none; border: none; color: var(--text-dim);
+                               cursor: pointer; font-size: 0.9rem; padding: 3px 6px;
+                               border-radius: 5px; line-height: 1; }
+    .sidebar-actions button:hover { background: var(--border); color: var(--text); }
+    .sidebar-section { padding: 8px 10px 3px; font-size: 0.65rem; color: var(--muted);
+                       text-transform: uppercase; letter-spacing: .06em; }
     .file-list { flex: 1; overflow-y: auto; padding: 4px 0; }
-    .file-item { padding: 6px 12px; font-size: 0.82rem; cursor: pointer; color: #a6adc8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-item:hover { background: #313244; color: #cdd6f4; }
-    .file-item.active { background: #313244; color: #cba6f7; font-weight: 600; }
-    /* Editor */
-    .editor-pane { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #313244; min-width: 0; }
-    .editor-pane .CodeMirror { flex: 1; height: 100%; font-size: 13px; line-height: 1.6; }
+    .file-item { padding: 5px 12px; font-size: 0.8rem; cursor: pointer; color: var(--text-dim);
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                 border-left: 2px solid transparent; transition: all .1s; }
+    .file-item:hover { background: var(--border); color: var(--text); }
+    .file-item.active { background: rgba(124,58,237,.12); color: #a78bfa;
+                        border-left-color: var(--accent); font-weight: 600; }
+    .file-item.img-item { color: var(--blue); cursor: pointer; }
+    .file-item.img-item:hover { background: var(--border); }
+
+    /* ── Editor ── */
+    .editor-pane { flex: 1; display: flex; flex-direction: column;
+                   border-right: 1px solid var(--border); min-width: 0; }
+    .editor-pane .CodeMirror { flex: 1; height: 100%; font-size: 13px; line-height: 1.65;
+                                font-family: 'JetBrains Mono', 'Fira Code', monospace; }
     .editor-pane .CodeMirror-scroll { height: 100%; }
-    /* Preview */
-    .preview-pane { flex: 1; background: #181825; display: flex; flex-direction: column; min-width: 0; }
+
+    /* ── Preview ── */
+    .preview-pane { flex: 1; background: var(--surface); display: flex;
+                    flex-direction: column; min-width: 0; }
     .preview-pane iframe { flex: 1; border: none; background: white; }
-    .error-box { padding: 16px; background: #302030; color: #f38ba8; font-family: monospace; font-size: 0.8rem; overflow-y: auto; max-height: 200px; }
+    .error-box { padding: 14px 16px; background: rgba(248,81,73,.08);
+                 border-top: 1px solid rgba(248,81,73,.3); color: var(--red);
+                 font-family: 'JetBrains Mono', monospace; font-size: 0.75rem;
+                 overflow-y: auto; max-height: 180px; }
     .error-box pre { white-space: pre-wrap; }
+
+    /* ── Modal: Neue Datei ── */
+    .modal-backdrop { display: none; position: fixed; inset: 0;
+                      background: rgba(0,0,0,.7); z-index: 100;
+                      align-items: center; justify-content: center; }
+    .modal-backdrop.open { display: flex; }
+    .modal { background: var(--surface); border: 1px solid var(--border);
+             border-radius: 10px; padding: 22px; width: 340px;
+             box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+    .modal h2 { font-size: 0.95rem; color: var(--text); margin-bottom: 14px; font-weight: 600; }
+    .modal input[type=text] { width: 100%; padding: 8px 10px; background: var(--bg);
+                               border: 1px solid var(--border); border-radius: 6px;
+                               color: var(--text); font-size: 0.85rem; margin-bottom: 14px; }
+    .modal input[type=text]:focus { outline: none; border-color: var(--accent); }
+    .modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
+    .modal-btns button { padding: 6px 14px; border: none; border-radius: 6px;
+                         cursor: pointer; font-size: 0.82rem; font-weight: 600; }
+    .btn-ok     { background: var(--accent); color: #fff; }
+    .btn-ok:hover { background: var(--accent-h); }
+    .btn-cancel { background: var(--border); color: var(--text-dim); }
+    .btn-cancel:hover { background: var(--muted); }
+
+    /* ── Lightbox ── */
+    .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
+                z-index: 200; align-items: center; justify-content: center; cursor: zoom-out; }
+    .lightbox.open { display: flex; }
+    .lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 6px;
+                    box-shadow: 0 8px 40px rgba(0,0,0,.6); }
   </style>
 </head>
 <body>
@@ -346,12 +491,19 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     <h1>Web-LaTeX Editor</h1>
     <button class="btn btn-compile" id="compileBtn" onclick="compile()">▶ Kompilieren</button>
     <span class="status" id="status"></span>
-    <span class="user-info">{{ username }}</span>
+    <span class="user-badge">{{ username }}</span>
     <a href="/logout" class="btn btn-logout">Abmelden</a>
   </header>
   <main>
     <div class="sidebar">
-      <div class="sidebar-header">Dateien</div>
+      <div class="sidebar-header">
+        <span>Explorer</span>
+        <div class="sidebar-actions">
+          <button onclick="openNewFileModal()" title="Neue .tex-Datei">＋</button>
+          <button onclick="document.getElementById('imgUpload').click()" title="Bild hochladen">↑</button>
+          <input type="file" id="imgUpload" accept=".png,.jpg,.jpeg,.gif" style="display:none" onchange="uploadImage(this)">
+        </div>
+      </div>
       <div class="file-list" id="fileList"></div>
     </div>
     <div class="editor-pane">
@@ -363,109 +515,186 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
     </div>
   </main>
 
+  <!-- Modal: Neue Datei -->
+  <div class="modal-backdrop" id="newFileModal" onclick="if(event.target===this)closeNewFileModal()">
+    <div class="modal">
+      <h2>Neue .tex-Datei erstellen</h2>
+      <input type="text" id="newFileName" placeholder="z.B. chapters/methodik"
+             onkeydown="if(event.key==='Enter')confirmNewFile()">
+      <div class="modal-btns">
+        <button class="btn-cancel" onclick="closeNewFileModal()">Abbrechen</button>
+        <button class="btn-ok" onclick="confirmNewFile()">Erstellen</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Lightbox: Bild anzeigen -->
+  <div class="lightbox" id="lightbox" onclick="closeLightbox()">
+    <img id="lightboxImg" src="" alt="">
+  </div>
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
   <script>
     const editor = CodeMirror.fromTextArea(document.getElementById('editor'), {
-      mode: 'stex',
-      theme: 'dracula',
-      lineNumbers: true,
-      lineWrapping: true,
-      autofocus: true,
-      extraKeys: { 'Ctrl-Enter': compile, 'Cmd-Enter': compile }
+      mode: 'stex', theme: 'dracula', lineNumbers: true, lineWrapping: true,
+      autofocus: true, extraKeys: { 'Ctrl-Enter': compile, 'Cmd-Enter': compile }
     });
     editor.setSize('100%', '100%');
 
-    // Datei-Cache: ungespeicherte Änderungen pro Datei merken
     const fileCache = {};
     let currentFile = 'master.tex';
 
     async function loadFileList() {
       const res = await fetch('/files');
-      const files = await res.json();
+      const data = await res.json();
       const list = document.getElementById('fileList');
       list.innerHTML = '';
-      files.forEach(f => {
-        const item = document.createElement('div');
-        item.className = 'file-item' + (f === currentFile ? ' active' : '');
-        item.textContent = f;
-        item.title = f;
-        item.onclick = () => switchFile(f);
-        list.appendChild(item);
+
+      if (data.tex && data.tex.length > 0) {
+        const sec = document.createElement('div');
+        sec.className = 'sidebar-section';
+        sec.textContent = 'LaTeX';
+        list.appendChild(sec);
+        data.tex.forEach(f => {
+          const item = document.createElement('div');
+          item.className = 'file-item' + (f === currentFile ? ' active' : '');
+          item.textContent = f;
+          item.title = f;
+          item.onclick = () => switchFile(f);
+          list.appendChild(item);
+        });
+      }
+
+      if (data.images && data.images.length > 0) {
+        const sec = document.createElement('div');
+        sec.className = 'sidebar-section';
+        sec.textContent = 'Bilder';
+        list.appendChild(sec);
+        data.images.forEach(f => {
+          const item = document.createElement('div');
+          item.className = 'file-item img-item';
+          item.textContent = f;
+          item.title = 'Klicken zum Anzeigen · \\includegraphics{' + f + '}';
+          item.onclick = () => openLightbox(f);
+          list.appendChild(item);
+        });
+      }
+    }
+
+    function openLightbox(relpath) {
+      document.getElementById('lightboxImg').src = '/image/' + relpath + '?t=' + Date.now();
+      document.getElementById('lightbox').classList.add('open');
+    }
+    function closeLightbox() {
+      document.getElementById('lightbox').classList.remove('open');
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+    function openNewFileModal() {
+      document.getElementById('newFileName').value = '';
+      document.getElementById('newFileModal').classList.add('open');
+      setTimeout(() => document.getElementById('newFileName').focus(), 50);
+    }
+    function closeNewFileModal() {
+      document.getElementById('newFileModal').classList.remove('open');
+    }
+
+    async function confirmNewFile() {
+      const name = document.getElementById('newFileName').value.trim();
+      if (!name) return;
+      const res = await fetch('/new-file', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
       });
+      const data = await res.json();
+      closeNewFileModal();
+      if (data.error) { alert(data.error); return; }
+      await loadFileList();
+      switchFile(data.name);
+    }
+
+    async function uploadImage(input) {
+      const file = input.files[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append('file', file);
+      setStatus('saving', 'Lädt hoch...');
+      const res = await fetch('/upload-image', { method: 'POST', body: form });
+      const data = await res.json();
+      input.value = '';
+      if (data.error) { setStatus('err', '✗ ' + data.error); return; }
+      setStatus('ok', '✓ Bild hochgeladen');
+      await loadFileList();
+      setTimeout(() => { if (document.getElementById('status').textContent.startsWith('✓ Bild')) setStatus('', ''); }, 3000);
     }
 
     async function switchFile(filename) {
-      // Aktuellen Stand im Cache speichern
       fileCache[currentFile] = editor.getValue();
-      // Aktiven Eintrag wechseln
       document.querySelectorAll('.file-item').forEach(el => {
         el.classList.toggle('active', el.textContent === filename);
       });
       currentFile = filename;
-      // Aus Cache laden oder vom Server holen
       if (fileCache[filename] !== undefined) {
         editor.setValue(fileCache[filename]);
       } else {
         const res = await fetch('/file/' + filename);
-        const data = await res.json();
-        editor.setValue(data.content);
-        fileCache[filename] = data.content;
+        const d = await res.json();
+        editor.setValue(d.content);
+        fileCache[filename] = d.content;
       }
       editor.focus();
     }
 
     async function saveCurrentFile() {
+      const content = editor.getValue();
       await fetch('/file/' + currentFile, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: editor.getValue() })
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content })
       });
-      fileCache[currentFile] = editor.getValue();
+      fileCache[currentFile] = content;
+    }
+
+    function setStatus(cls, text) {
+      const el = document.getElementById('status');
+      el.className = cls ? 'status ' + cls : 'status';
+      el.textContent = text;
     }
 
     async function compile() {
-      // Aktuelle Datei speichern bevor kompiliert wird
+      // Aktuelle Datei speichern — alle anderen wurden beim Tippen bereits auto-gespeichert
       await saveCurrentFile();
       const btn = document.getElementById('compileBtn');
-      const status = document.getElementById('status');
       const errorBox = document.getElementById('errorBox');
-      const errorText = document.getElementById('errorText');
       btn.disabled = true;
-      status.className = 'status compiling';
-      status.textContent = 'Kompiliert...';
+      setStatus('saving', 'Kompiliert...');
       errorBox.style.display = 'none';
       try {
-        // master.tex Inhalt aus Cache oder Server holen
-        const masterContent = fileCache['master.tex'] !== undefined
-          ? fileCache['master.tex']
-          : await fetch('/file/master.tex').then(r => r.json()).then(d => d.content);
-        const res = await fetch('/compile', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: masterContent })
-        });
+        const res = await fetch('/compile', { method: 'POST' });
         const data = await res.json();
         if (data.success) {
-          status.className = 'status ok';
-          status.textContent = '✓ Erfolgreich';
+          setStatus('ok', '✓ Erfolgreich');
           document.getElementById('preview').src = '/pdf?t=' + Date.now();
           errorBox.style.display = 'none';
         } else {
-          status.className = 'status err';
-          status.textContent = '✗ Fehler';
-          errorText.textContent = data.errors.join('\n');
+          setStatus('err', '✗ Fehler');
+          document.getElementById('errorText').textContent = data.errors.join('\n');
           errorBox.style.display = 'block';
         }
       } catch (e) {
-        status.className = 'status err';
-        status.textContent = '✗ Verbindungsfehler';
+        setStatus('err', '✗ Verbindungsfehler');
       } finally {
         btn.disabled = false;
       }
     }
 
-    // Beim Start Dateiliste laden
+    // Auto-save beim Tippen (500ms debounce)
+    let saveTimer = null;
+    editor.on('change', () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(saveCurrentFile, 500);
+    });
+
     loadFileList();
   </script>
 </body>
@@ -494,9 +723,6 @@ sudo chown -R www-data:www-data /opt/weblatex /var/www/weblatex
 sudo mkdir -p /etc/weblatex/users
 sudo chown root:www-data /etc/weblatex /etc/weblatex/users
 sudo chmod 750 /etc/weblatex /etc/weblatex/users
-sudo python3 -c "import os; open('/etc/weblatex/flask_secret','wb').write(os.urandom(32))"
-sudo chown root:www-data /etc/weblatex/flask_secret
-sudo chmod 640 /etc/weblatex/flask_secret
 sudo systemctl daemon-reload
 sudo systemctl enable weblatex
 
