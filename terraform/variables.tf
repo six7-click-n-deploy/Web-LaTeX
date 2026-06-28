@@ -21,12 +21,12 @@ variable "image_name" {
 
 variable "assignment_files" {
   description = "ZIP-Aufgabenstellung pro Team @openstack:file:team:zip"
-  type = map(object({
+  type = map(map(object({
     name         = string
     content_b64  = string
     content_type = string
     size         = number
-  }))
+  })))
   default = {}
 }
 
