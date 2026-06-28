@@ -6,13 +6,13 @@ bootcmd:
   - chmod 750 /etc/weblatex /etc/weblatex/users
 
 write_files:
-%{ for uid, file in assignment_files ~}
-  - path: /tmp/assignment/${file.name}
+%{ if length(assignment_files) > 0 ~}
+  - path: /tmp/assignment/${assignment_files.name}
     permissions: '0644'
     owner: root:root
     encoding: b64
-    content: ${file.content_b64}
-%{ endfor ~}
+    content: ${assignment_files.content_b64}
+%{ endif ~}
 
 %{ for user in team_users ~}
   - path: /etc/weblatex/users/${replace(replace(user.email, "@", "_at_"), ".", "-")}.env
