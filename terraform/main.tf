@@ -25,6 +25,7 @@ locals {
   app_name           = "web-latex"
   flavor             = "gp1.small"
   enable_floating_ip = true
+  key_pair           = ""
 }
 
 data "openstack_images_image_v2" "image" {
@@ -82,7 +83,7 @@ resource "openstack_compute_instance_v2" "team_vm" {
   name        = "${local.app_name}-${each.key}"
   image_id    = data.openstack_images_image_v2.image.id
   flavor_name = local.flavor
-  key_pair    = var.key_pair != "" ? var.key_pair : null
+  key_pair    = local.key_pair != "" ? local.key_pair : null
 
   timeouts {
     create = "15m"

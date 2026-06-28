@@ -51,9 +51,3 @@ variable "shared_secgroup_id" {
   type        = string
   default     = "4ffaf007-df66-4250-9118-1bd99378d34a"
 }
-
-variable "key_pair" {
-  description = "OpenStack Keypair Name für SSH-Zugang (optional) @openstack:keypair:name"
-  type        = string
-  default     = ""
-}
