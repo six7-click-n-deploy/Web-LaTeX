@@ -6,7 +6,7 @@ bootcmd:
   - chmod 750 /etc/weblatex /etc/weblatex/users
 
 write_files:
-%{ if length(assignment_files) > 0 ~}
+%{ if assignment_files != null ~}
   - path: /tmp/assignment/${assignment_files.name}
     permissions: '0644'
     owner: root:root
