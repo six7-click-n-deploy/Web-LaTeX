@@ -500,7 +500,7 @@ sudo tee /opt/weblatex/templates/index.html > /dev/null << 'HTMLEOF'
         <span>Explorer</span>
         <div class="sidebar-actions">
           <button onclick="openNewFileModal()" title="Neue .tex-Datei">＋</button>
-          <button onclick="document.getElementById('imgUpload').click()" title="Bild hochladen">↑</button>
+          <button onclick="document.getElementById('imgUpload').click()" title="Bild hochladen">+ Bild</button>
           <input type="file" id="imgUpload" accept=".png,.jpg,.jpeg,.gif" style="display:none" onchange="uploadImage(this)">
         </div>
       </div>
